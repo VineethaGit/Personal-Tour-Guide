@@ -1,224 +1,183 @@
 # main.py
 
+import folium
 import streamlit as st
-from agents import (
-    CategorizerAgent, GeneralAgent, LocationAgent,
-    TimeAgent, TicketAgent, CultureInsightsAgent,
-    TipsAgent, FacilitiesAgent, ExperienceAgent,
-    RecommendationAgent, LanguageAgent, WriterAgent
-)
 from dotenv import load_dotenv
+from geopy.geocoders import Nominatim
+from streamlit_folium import st_folium
+
+from agents import (
+    OPENWEATHER_API_KEY,
+    describe_image_with_gemini,
+    get_weather_by_coords,
+    route_query,
+    text_to_speech,
+    TourPlannerAgent,
+)
+
 load_dotenv()
 
-st.set_page_config(page_title="Heritage Site Explorer", layout="wide")
-
-
+st.set_page_config(page_title="VirtuTrek: AI-Powered Virtual Tour Assistant", layout="wide")
 
 st.markdown("""
     <style>
-    /* Sidebar Styling */
-    .stSidebar {
-        background-color: #2c3e50; /* Dark blue-gray for a modern look */
-        color: white; /* White text for better readability */
-    }
-
-    /* Button Styling */
-    .stButton {
-        
-        color: white; /* White text for visibility */
-        border-radius: 5px; /* Slight rounded corners */
-        font-weight: bold; /* Emphasize the button text */
-    }
-
-    /* Button Hover Effect */
-    .stButton:hover {
-        
-        transition: background-color 0.3s ease; /* Smooth transition */
-    }
-    
-    /* Submit Button Specific Styling */
+    .stSidebar { background-color: #2c3e50; color: white; }
+    .stButton { color: white; border-radius: 5px; font-weight: bold; }
+    .stButton:hover { transition: background-color 0.3s ease; }
     .stButton[data-baseweb="button"] {
-        background-color: #e74c3c; /* Red background for the submit button */
-        color: white; /* White text for visibility */
-        font-size: 16px; /* Slightly larger font for emphasis */
-        padding: 12px 30px; /* Adjust padding for the submit button */
-        border-radius: 8px; /* More rounded corners */
+        background-color: #e74c3c; color: white; font-size: 16px;
+        padding: 12px 30px; border-radius: 8px;
     }
-
-    /* Main Title Styling */
-    h1 {
-        color: #e74c3c; /* Bold red for the title */
-        font-size: 36px; /* Larger font size */
-        text-align: center; /* Center the title */
-    }
-
-    /* Sidebar Header Styling */
-    .stSidebar h2 {
-        color: #ecf0f1; /* Light gray for sidebar headers */
-    }
-
-    /* General Text Styling */
-    .stMarkdown {
-        font-size: 18px; /* Slightly larger text for readability */
-        color: #ecf0f1; /* Light gray text for readability */
-        line-height: 1.6; /* Better spacing for easier reading */
-    }
-
-    /* Input fields Styling */
+    h1 { color: #e74c3c; font-size: 36px; text-align: center; }
+    .stSidebar h2 { color: #ecf0f1; }
+    .stMarkdown { font-size: 18px; color: #ecf0f1; line-height: 1.6; }
     .stTextInput, .stTextArea, .stMultiSelect {
-        background-color: #34495e; /* Darker background for input fields */
-        border-radius: 5px; /* Slight rounded corners */
-        padding: 10px; /* Add padding for better input field appearance */
-        color: white; /* White text for better visibility */
+        background-color: #34495e; border-radius: 5px; padding: 10px; color: white;
     }
-
-    /* Placeholder Text */
-    .stTextInput::placeholder, .stTextArea::placeholder {
-        color: #bdc3c7; /* Lighter color for placeholder text */
-    }
-
-    /* Select and Multi-Select Dropdown Styling */
-    .stMultiSelect {
-        background-color: #34495e; /* Darker background for multi-select */
-        border-radius: 5px;
-        padding: 10px;
-        color: white; /* White text */
-    }
-
-    /* Sidebar Text Styling */
-    .stSidebar .stMarkdown {
-        color: #ecf0f1; /* Ensure visibility of text in sidebar */
-    }
-
-    /* Title in the Sidebar */
-    .stSidebar h1 {
-        color: #ecf0f1; /* Light gray for sidebar titles */
-    }
-
-    /* Text in the Buttons */
-    .stButton p {
-        color: white; /* White text inside buttons */
-    }
-    
-    /* Make links more visible */
-    a {
-        color: #3498db; /* Blue for links */
-    }
-    a:hover {
-        color: #2980b9; /* Darker blue for hover effect */
-    }
-
-    /* Ensure visibility of labels and inputs */
-    .stTextInput label, .stTextArea label, .stMultiSelect label {
-        color: white; /* White text for labels */
-    }
+    .stTextInput::placeholder, .stTextArea::placeholder { color: #bdc3c7; }
+    .stSidebar .stMarkdown { color: #ecf0f1; }
+    .stSidebar h1 { color: #ecf0f1; }
+    .stButton p { color: white; }
+    a { color: #3498db; }
+    a:hover { color: #2980b9; }
+    .stTextInput label, .stTextArea label, .stMultiSelect label { color: white; }
     </style>
 """, unsafe_allow_html=True)
 
-# Sidebar Title and Description
-st.sidebar.title("Heritage Info Assistant")
+st.sidebar.title("VirtuTrek")
 st.sidebar.markdown("""
-Welcome to the Heritage Info Assistant! 🌍
+Your AI-powered virtual tour assistant. 🌍
 
-This app helps you explore famous heritage sites by answering questions about:
-
-- 📍 Location & accessibility  
-- ⏰ Visiting hours  
-- 🎟️ Tickets & pricing  
-- 🏛️ History & cultural insights  
-- 🧳 Travel tips & rules  
-- 🗺️ Nearby attractions  
-- 💬 Language & guides
-
-Just type a question or click one of the examples to get started!
+- 💬 **AI Tour Guide** — ask about history, architecture, travel, food, or weather.
+- 🖼 **Image Analysis** — upload a landmark photo for instant insights.
+- 🗺 **Tour Planner** — a personalized itinerary built from your mood & interests.
 """)
 
+st.title("🌍 VirtuTrek: AI-Powered Virtual Tour Assistant")
 
-st.title("🌍 Heritage Site Explorer")
-
-# Title or header
-
-
-# Example queries (one per category)
-example_queries = [
-    "Tell me about the Taj Mahal.",                             # General Information
-    "Where is Angkor Wat located?",                              # Location & Accessibility
-    "What are the opening hours of the Louvre?",                 # Visiting Hours & Timing
-    "How much is the entry fee for the Acropolis?",              # Tickets & Pricing
-    "Who built the Pyramids of Giza and why?",                   # Historical & Cultural Insights
-    "What should I wear when visiting the Golden Temple?",       # Visitor Tips & Rules
-    "What can I see near the Eiffel Tower?",                     # Facilities & Nearby Attractions
-    "Can I get a private tour of the Red Fort?",                 # Custom Experience
-    "Which is better to visit—Hampi or Badami?",                 # Comparison & Recommendations
-    "What language is spoken at Hampi?"                          # Language & Culture
-]
+chat_tab, image_tab, planner_tab = st.tabs(["💬 AI Tour Guide", "🖼 Image Analysis", "🗺 Tour Planner"])
 
 
-selected_query = None
-query = "select a query"
+# ---------------------------------------------------------------------------
+# Tab 1: AI Tour Guide chatbot
+# ---------------------------------------------------------------------------
+with chat_tab:
+    example_queries = [
+        "Tell me about the history of the Taj Mahal.",
+        "What architectural style is the Angkor Wat built in?",
+        "How do I get to the Louvre and what are the entry fees?",
+        "What's the weather like in Cairo right now?",
+        "Where should I stay and eat near the Acropolis?",
+        "Haha this app is pretty cool!",
+    ]
+
+    selected = st.selectbox("Try an example query", ["select a query"] + example_queries)
+    default_text = selected if selected != "select a query" else ""
+    topic = st.text_input("Ask something about a heritage site:", value=default_text, key="chat_topic")
+
+    if st.button("Ask our AI Tour Guide"):
+        if not topic.strip():
+            st.warning("Please enter a question first.")
+        else:
+            with st.spinner("Thinking..."):
+                result = route_query(topic)
+            st.caption(f"Category: {result['category']}")
+            st.markdown(result["answer"])
 
 
-selected =  st.sidebar.selectbox(query,example_queries)
-if selected:
-    selected_query = selected
+# ---------------------------------------------------------------------------
+# Tab 2: Image-to-Insight
+# ---------------------------------------------------------------------------
+with image_tab:
+    st.markdown("Upload a photo of a landmark and let Gemini Vision identify it.")
 
-# Input box – prefilled if user clicked a button
-default_text = selected_query if selected_query else ""
-topic = st.text_input("Ask something about a heritage site:", value=default_text)
+    uploaded_file = st.file_uploader("Landmark photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    user_location = st.text_input(
+        "Your location (city, country) — optional, shows a route on the map",
+        key="user_location",
+    )
 
-# topic = st.text_input("Enter a heritage site name or query:")
+    if st.button("Analyze Image"):
+        if not uploaded_file:
+            st.warning("Please upload an image first.")
+        else:
+            bytes_data = uploaded_file.read()
+            with st.spinner("Analyzing your image..."):
+                analysis = describe_image_with_gemini(bytes_data)
 
-if st.button("Ask our AI Tour Guide"):
-    agent = CategorizerAgent()
-    response = agent.categorize_topic(topic)
-    category = response["category"]
-    # st.json(category)
-    
-    if category == "General Information":
-        generalizer = GeneralAgent()
-        data = generalizer.general_topic(topic)
-        
-    elif category == "Location & Accessibility":
-        generalizer = LocationAgent()
-        data = generalizer.locate(topic)
-        
-    elif category == "Location & Accessibility":
-        generalizer = LocationAgent()
-        data = generalizer.locate(topic)
-    
-    elif category == "Visiting Hours & Timing":
-        generalizer = TimeAgent()
-        data = generalizer.time(topic)
-        
-    elif category == "Tickets & Pricing":
-        generalizer = TicketAgent()
-        data = generalizer.ticket(topic)
-        
-    elif category == "Historical & Cultural Insights":
-        generalizer = CultureInsightsAgent()
-        data = generalizer.culture(topic)
-    
-    elif category == "Visitor Tips & Rules":
-        generalizer = TipsAgent()
-        data = generalizer.tips(topic)
-    
-    elif category == "Facilities & Nearby Attractions":
-        generalizer = FacilitiesAgent() 
-        data = generalizer.facility(topic)
-        
-    elif category == "Custom Experience":
-        generalizer = ExperienceAgent()
-        data = generalizer.experience(topic)
-        
-    elif category == "Comparison & Recommendations":
-        generalizer = RecommendationAgent()
-        data = generalizer.recommend(topic)
-        
-    elif category == "Language & Culture":
-        generalizer = LanguageAgent()
-        data = generalizer.language(topic)
+            col1, col2 = st.columns([1, 1.4])
+            with col1:
+                st.image(bytes_data, use_container_width=True)
+            with col2:
+                st.subheader(f"🏛️ {analysis['landmark']}, {analysis['city']}, {analysis['country']}")
+                st.markdown(analysis["description"])
 
-    writer = WriterAgent()
-    article = writer.write_article(data)
-    
-    st.markdown(article)
+                with st.spinner("🔊 Generating audio narration..."):
+                    try:
+                        audio_fp = text_to_speech(analysis["description"])
+                        st.audio(audio_fp.read(), format="audio/mp3")
+                    except Exception as e:
+                        st.info(f"Audio narration unavailable: {e}")
+
+            coords = analysis["coordinates"]
+            if coords:
+                st.subheader("🗺️ Map")
+                user_coords = None
+                if user_location.strip():
+                    geolocator = Nominatim(user_agent="virtutrek_tour_agent")
+                    location = geolocator.geocode(user_location)
+                    if location:
+                        user_coords = [location.latitude, location.longitude]
+                    else:
+                        st.info("Could not find that location — showing the landmark only.")
+
+                map_obj = folium.Map(location=coords, zoom_start=12)
+                folium.Marker(location=coords, tooltip=analysis["landmark"]).add_to(map_obj)
+                if user_coords:
+                    folium.Marker(
+                        location=user_coords, tooltip="Your Location",
+                        icon=folium.Icon(color="blue"),
+                    ).add_to(map_obj)
+                    folium.PolyLine([user_coords, coords], color="green", weight=2.5).add_to(map_obj)
+                    map_obj.fit_bounds([user_coords, coords])
+                st_folium(map_obj, width=None, height=420)
+
+                st.subheader("🌦️ Weather at the Landmark")
+                weather = get_weather_by_coords(*coords)
+                st.write(weather["summary"])
+                if weather["details"]:
+                    st.json(weather["details"])
+            else:
+                st.info("No coordinates were returned for this landmark, so the map and weather are unavailable.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 3: Personalized Tour Planner (RAG)
+# ---------------------------------------------------------------------------
+with planner_tab:
+    st.markdown("Tell us where you're headed and how you're feeling — we'll build a tour around it.")
+
+    city = st.text_input("Which city are you exploring?", key="planner_city")
+    preferences = st.text_input(
+        "Your interests (e.g., museums, food, history, nature)", key="planner_preferences"
+    )
+    mood = st.selectbox(
+        "How are you feeling today?",
+        ["adventurous", "relaxed", "curious", "romantic", "energetic"],
+        key="planner_mood",
+    )
+
+    if st.button("Plan My Tour"):
+        if not city.strip() or not preferences.strip():
+            st.warning("Please fill in both the city and your interests.")
+        else:
+            with st.spinner("Researching your destination and building a personalized plan..."):
+                plan = TourPlannerAgent().plan(city, preferences, mood)
+
+            st.subheader(f"Your {mood} tour of {plan['city']}")
+            st.markdown(plan["plan"])
+
+            with st.expander("🌦️ Weather details"):
+                st.json(plan["weather"])
+            with st.expander("🍽️ Food recommendations"):
+                st.markdown(plan["food"])

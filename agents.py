@@ -1,840 +1,651 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import Agent
-from langchain.tools import Tool
-from langchain.agents import AgentExecutor,ZeroShotAgent
-from langchain_community.utilities import SerpAPIWrapper
-from langchain.prompts import PromptTemplate
-from langchain.agents import initialize_agent, AgentType
+import io
+import json
+import os
+import re
+import time
+from io import BytesIO
+
+import google.generativeai as genai
+import nltk
+import numpy as np
 import requests
 from dotenv import load_dotenv
-import os
-import json
-import re
+from google.api_core.exceptions import ResourceExhausted
+from gtts import gTTS
+from langchain.agents import AgentType, initialize_agent
+from langchain.prompts import PromptTemplate
+from langchain.tools import Tool
+from langchain_community.utilities import SerpAPIWrapper
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from PIL import Image
 
 load_dotenv()
-google_api_key = os.getenv("GOOGLE_API_KEY")
-serp_api_key = os.getenv("SERPAPI_API_KEY")
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+MODEL_NAME = "gemini-flash-latest"
 
 
-def simple_calculator(x: str) -> str:
-    """A simple calculator that can do basic math operations."""
-    try:
-        result = eval(x)
-        return str(result)
-    except Exception as e:
-        return str(e)
-    
+# ---------------------------------------------------------------------------
+# Shared tools (used by the chatbot's ReAct agents)
+# ---------------------------------------------------------------------------
+
 def search_google(query: str) -> str:
     """Search Google using SerpAPI."""
-    serp = SerpAPIWrapper()
-    results = serp.run(query)
-    return results
+    serp = SerpAPIWrapper(serpapi_api_key=SERPAPI_API_KEY)
+    return serp.run(query)
 
 
-calculator = Tool(
-    name = "Calculator",
-    func=simple_calculator,
-    description="A simple calculator that can do basic math operations. Input should be a string like '2 + 2'.",
-)
+def _fetch_openweather(params: dict) -> dict | None:
+    """Call OpenWeatherMap's current-weather endpoint with either a `q` (city) or `lat`/`lon` param."""
+    if not OPENWEATHER_API_KEY:
+        return None
+    params = {**params, "appid": OPENWEATHER_API_KEY, "units": "metric"}
+    response = requests.get("https://api.openweathermap.org/data/2.5/weather", params=params, timeout=15).json()
+    return response if response.get("main") else None
+
+
+def get_weather_by_city(city: str) -> str:
+    """Get current weather for a city as a human-readable summary."""
+    if not OPENWEATHER_API_KEY:
+        return "Weather lookup is unavailable: OPENWEATHER_API_KEY is not configured."
+    try:
+        response = _fetch_openweather({"q": city})
+        if response:
+            main, weather, wind = response["main"], response["weather"][0], response["wind"]
+            return (
+                f"Weather in {city}:\n"
+                f"- Condition: {weather['description'].capitalize()}\n"
+                f"- Temperature: {main['temp']}°C\n"
+                f"- Feels Like: {main['feels_like']}°C\n"
+                f"- Humidity: {main['humidity']}%\n"
+                f"- Wind Speed: {wind.get('speed', 'N/A')} m/s"
+            )
+        return "Weather data not available."
+    except Exception as e:
+        return f"Weather data not available: {e}"
+
+
+def get_weather_summary_dict(city: str) -> dict:
+    """Get current weather for a city as a structured dict (used by the tour planner)."""
+    if not OPENWEATHER_API_KEY:
+        return {"description": "Weather lookup unavailable (OPENWEATHER_API_KEY not configured)."}
+    try:
+        response = _fetch_openweather({"q": city})
+        if response:
+            main, weather, wind = response["main"], response["weather"][0], response["wind"]
+            return {
+                "description": weather["description"],
+                "temperature": main["temp"],
+                "humidity": main["humidity"],
+                "wind": wind.get("speed", "N/A"),
+            }
+        return {"description": "Weather data not available."}
+    except Exception as e:
+        return {"description": f"Weather data not available: {e}"}
+
+
+def get_weather_by_coords(lat: float, lon: float) -> dict:
+    """Get current weather for coordinates using OpenWeatherMap (used by the image module)."""
+    if not OPENWEATHER_API_KEY:
+        return {"summary": "Weather lookup is unavailable: OPENWEATHER_API_KEY is not configured.", "details": None}
+    try:
+        response = _fetch_openweather({"lat": lat, "lon": lon})
+        if response:
+            temp = response["main"]["temp"]
+            desc = response["weather"][0]["description"]
+            humidity = response["main"]["humidity"]
+            wind_speed = response["wind"]["speed"]
+            return {
+                "summary": f"{desc.capitalize()} with temperature of {temp}°C",
+                "details": {
+                    "temperature": temp,
+                    "description": desc,
+                    "humidity": humidity,
+                    "wind_speed": wind_speed,
+                },
+            }
+        return {"summary": "Weather data not available.", "details": None}
+    except Exception as e:
+        return {"summary": f"Weather data not available: {e}", "details": None}
+
 
 web_search = Tool(
-    name = "Web Search",
+    name="Web Search",
     func=search_google,
     description="A tool to search the web using Google. Input should be a string like 'What is the capital of France?'.",
 )
 
-tools = [calculator, web_search]
+weather_search = Tool(
+    name="Weather Search",
+    func=get_weather_by_city,
+    description="A tool to get the weather of a heritage site or any city. Input should be a string like 'how is the weather in Paris?'.",
+)
+
+tools = [web_search, weather_search]
+
+
+def _clean_json_like(text: str) -> str:
+    return re.sub(r"^```json|```$", "", text).strip()
+
+
+def _invoke_with_retry(fn, *args, max_retries: int = 3, base_delay: float = 20, **kwargs):
+    """Call `fn` (an LLM/agent invoke) and retry on free-tier 429s with backoff."""
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except ResourceExhausted:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(base_delay * (attempt + 1))
+
+
+def _new_llm() -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(model=MODEL_NAME, google_api_key=GOOGLE_API_KEY)
+
+
+def _new_react_agent(verbose: bool = False):
+    llm = _new_llm()
+    agent = initialize_agent(
+        tools=tools,
+        llm=llm,
+        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        verbose=verbose,
+        handle_parsing_errors=True,
+    )
+    return llm, agent
+
+
+# ---------------------------------------------------------------------------
+# Module 1: Chatbot — categorizer + specialist subagents
+# ---------------------------------------------------------------------------
+
+CHAT_CATEGORIES = [
+    "Historical Information",
+    "Architectural Details",
+    "Travel or Logistics",
+    "Accommodation and Dining",
+    "General Conversation",
+    "Weather Information",
+    "Unrecognized",
+]
 
 
 class CategorizerAgent:
     def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=True,
-            handle_parsing_errors=True
-        )
-    
-    def categorize_topic(self, topic):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def categorize_topic(self, text: str) -> str:
         prompt = f"""
-        You are a Categorizer AI Agent that receives natural language queries from users about heritage or historical sites.
+        You are the Categorizer Agent, a specialized AI component responsible for analyzing the user's input and classifying it into one of the predefined categories based strictly on the content and intent of the message.
 
-        Your task is to extract structured metadata from the query and return a **strictly valid JSON object** in the following format:
+        Your job is to accurately detect the user's intent and return only the matching category label from the list below. You should not perform any processing or delegation yourself — your role is limited to categorization only.
 
-        {{
-        "category": "<One of: General Information, Location & Accessibility, Visiting Hours & Timing, Tickets & Pricing, Historical & Cultural Insights, Visitor Tips & Rules, Facilities & Nearby Attractions, Custom Experience, Comparison & Recommendations, Language & Culture>",
-        "site": "<The name of the heritage site mentioned, if any. If none specified, write 'Unknown'>",
-        "intent": "<A short natural language phrase explaining what the user wants to know or achieve>",
-        "question_type": "<One of: fact, opinion, recommendation, instruction, comparison, clarification>"
-        }}
+        Available Categories (choose exactly one):
+        - "Historical Information" - if the user is asking about the history of a place, monument, or heritage site.
+        - "Architectural Details" - if the user is interested in the design, structure, style, or architecture of a place.
+        - "Travel or Logistics" - if the user is asking how to reach a place, travel duration, entry fee, timings, routes, etc.
+        - "Accommodation and Dining" - if the user is seeking places to stay, eat, nearby attractions, or leisure activities.
+        - "General Conversation" - if the user is making casual remarks, greetings, jokes, or off-topic chit-chat.
+        - "Weather Information" - if the user is asking about the weather of a place.
+        - "Unrecognized" - if the input does not fit into any of the above categories.
 
-        Instructions:
-        - Use only one category per query.
-        - Focus only on heritage/tourist/historical-related topics.
-        - Keep your output strictly in raw JSON (no markdown, no code block).
-        - Do not explain or narrate anything outside the JSON object.
-        - If the site is not mentioned, set "site" as "Unknown".
+        Output format: return only a single line of text with just the category label, nothing else. Do not explain or comment on your decision. Do not repeat the input.
 
-        Now, categorize the following user query:
-        "{topic}"
+        User input: {text}
         """
-        response = self.llm.invoke(prompt).content.strip()
-        
-        # Clean markdown-style formatting (if any)
-        response = re.sub(r"^```json|```$", "", response).strip()
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
 
+
+class HistoryExpertAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def history_info(self, text: str) -> str:
+        prompt = f"""
+        You are the History Expert Subagent, responsible for providing detailed, accurate, and insightful historical context for any heritage site, landmark, or culturally significant location the user inquires about.
+
+        Your responsibilities:
+        - Provide verified historical facts (e.g., date of construction, founder, purpose, major events).
+        - Highlight the cultural and political significance of the location.
+        - Mention any legends, folklore, or myths associated with the place, if applicable.
+        - Be clear, concise, and structured — no fluff or filler.
+
+        User input: {text}
+
+        Return your output in this format:
+        Name of Site:
+        Historical Overview:
+        Timeline of Key Events:
+        Interesting Facts or Stories:
+        Source Reliability: High / Medium / Low
+        """
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
+
+
+class ArchitecturalExpertAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def architecture_info(self, text: str) -> str:
+        prompt = f"""
+        You are the Architectural Expert Subagent, responsible for analyzing and explaining the structural, stylistic, and artistic aspects of a monument, temple, fort, or other built heritage.
+
+        Your responsibilities:
+        - Identify the architectural style (e.g., Mughal, Dravidian, Gothic, Colonial).
+        - Mention the materials, structural techniques, and artistic features used.
+        - Point out any symbolic design elements or layout significance.
+        - Provide comparisons with similar structures if relevant.
+
+        User input: {text}
+
+        Return your output in this format:
+        Name of Site:
+        Architectural Style:
+        Materials Used:
+        Structural Highlights:
+        Artistic Elements (e.g., carvings, frescoes, motifs):
+        Special Features / Innovations:
+        """
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
+
+
+class WeatherForecasterAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def weather_info(self, text: str) -> str:
+        location_prompt = f"""
+        You are a Weather Location Extractor Subagent. Your job is to extract the name of the city or place the user is asking about in their query.
+
+        Only return the name of the city or place - nothing else. The place name should be suitable to pass into a weather API.
+
+        User input: {text}
+
+        Extracted location:
+        """
+        location = _invoke_with_retry(self.llm.invoke, location_prompt).content.strip()
+        location = _clean_json_like(location)
+
+        raw_weather = get_weather_by_city(location)
+        summary_prompt = f"""
+        You are a weather forecaster. Present the following weather details in a clear, friendly, easy-to-read way for a traveler:
+        {raw_weather}
+        """
+        return _invoke_with_retry(self.llm.invoke, summary_prompt).content.strip()
+
+
+class TravelLogisticsAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def travel_info(self, text: str) -> str:
+        prompt = f"""
+        You are the Travel Logistics Subagent, tasked with providing up-to-date and practical information on how to reach a specific tourist location.
+
+        Your responsibilities:
+        - Provide recommended modes of transport (train, bus, flight, taxi).
+        - Mention nearest transport hubs (airport, railway station).
+        - Approximate travel time and cost from common points (e.g., major cities).
+        - Include entry fees, opening/closing times, and best visiting seasons.
+        - Mention accessibility (elderly-friendly, wheelchair access, etc.) if applicable.
+
+        User input: {text}
+
+        Return your output in this format:
+        Location:
+        Nearest Airport/Station:
+        Travel Options:
+        Travel Duration & Cost Estimates:
+        Entry Fee & Timings:
+        Best Time to Visit:
+        Accessibility Notes:
+        """
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
+
+
+class AccommodationDiningAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def accommodation_info(self, text: str) -> str:
+        prompt = f"""
+        You are the Accommodation and Dining Expert Subagent, responsible for suggesting where to stay, what to eat, and what else to explore nearby.
+
+        Your responsibilities:
+        - Recommend accommodations across budget ranges (luxury, mid-range, budget).
+        - Suggest authentic or popular local dining spots.
+        - Recommend nearby attractions and activities for tourists.
+        - Mention safety tips and local etiquette if relevant.
+
+        User input: {text}
+
+        Return your output in this format:
+        Location:
+        Top Accommodation Picks:
+        - Luxury:
+        - Mid-range:
+        - Budget:
+        Recommended Eateries:
+        - Local Cuisine:
+        - Vegetarian/Vegan Options:
+        Nearby Attractions/Activities:
+        Safety Tips & Local Etiquette:
+        """
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
+
+
+class ConversationalGuideAgent:
+    def __init__(self):
+        self.llm, self.agent = _new_react_agent(verbose=False)
+
+    def convo_info(self, text: str) -> str:
+        prompt = f"""
+        You are a Conversational Tour Guide Subagent. Your role is to engage in friendly, casual conversation with users as if you're accompanying them on a relaxed tour.
+
+        Your tone is warm, conversational, and attentive. You don't wait for commands or tasks; instead, you respond naturally to whatever the user says - like a human guide would during small talk.
+
+        If the user shares a feeling, observation, or random thought, respond with something related, thoughtful, or playful. You are not here to perform tasks, give definitions, or answer deep factual queries - just keep the energy light, interesting, and human.
+
+        Keep responses short and context-aware. Ask casual follow-up questions if it feels right. Never prompt the user to "ask a question." Just go with the flow.
+
+        User input: {text}
+        """
+        response = _invoke_with_retry(self.llm.invoke, prompt).content.strip()
+        return _clean_json_like(response)
+
+
+def route_query(topic: str) -> dict:
+    """Categorize a query and dispatch it to the matching specialist subagent."""
+    category = CategorizerAgent().categorize_topic(topic)
+
+    if category == "Historical Information":
+        answer = HistoryExpertAgent().history_info(topic)
+    elif category == "Architectural Details":
+        answer = ArchitecturalExpertAgent().architecture_info(topic)
+    elif category == "Weather Information":
+        answer = WeatherForecasterAgent().weather_info(topic)
+    elif category == "Travel or Logistics":
+        answer = TravelLogisticsAgent().travel_info(topic)
+    elif category == "Accommodation and Dining":
+        answer = AccommodationDiningAgent().accommodation_info(topic)
+    else:
+        category = category if category in CHAT_CATEGORIES else "Unrecognized"
+        answer = ConversationalGuideAgent().convo_info(topic)
+
+    return {"category": category, "answer": answer}
+
+
+# ---------------------------------------------------------------------------
+# Module 2: Image-to-Insight — Gemini Vision landmark analysis
+# ---------------------------------------------------------------------------
+
+def describe_image_with_gemini(image_bytes: bytes) -> dict:
+    """Identify a landmark from a photo and return structured details."""
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(MODEL_NAME)
+    image = Image.open(io.BytesIO(image_bytes))
+
+    prompt = """
+    You are a landmark detection assistant.
+    Given an image, identify the landmark, its full name, city, and country.
+    Return your answer in the following JSON format:
+
+    {
+        "landmark": "Eiffel Tower",
+        "city": "Paris",
+        "country": "France",
+        "description": "A wrought iron lattice tower built on the Champ de Mars in Paris.",
+        "coordinates": [48.8584, 2.2945]
+    }
+
+    For the "description" field, give a comprehensive overview covering its historical background,
+    cultural importance, geographical features, famous attractions, and why it's worth visiting,
+    in max 3 paragraphs. Provide the description in markdown.
+    If you're unsure, write "Unknown" for the relevant fields.
+    """
+
+    try:
+        response = model.generate_content([prompt, image])
+        match = re.search(r"\{.*?\}", response.text, re.DOTALL)
+        if not match:
+            raise ValueError("Gemini response was not valid JSON.")
+        output = json.loads(match.group())
+
+        coords = output.get("coordinates")
+        if coords and isinstance(coords, list) and len(coords) == 2:
+            coords = tuple(coords)
+        else:
+            coords = None
+
+        return {
+            "landmark": output.get("landmark", "Unknown"),
+            "city": output.get("city", "Unknown"),
+            "country": output.get("country", "Unknown"),
+            "description": output.get("description", "No description provided."),
+            "coordinates": coords,
+        }
+    except Exception as e:
+        return {
+            "landmark": "Unknown",
+            "city": "Unknown",
+            "country": "Unknown",
+            "description": f"Analysis failed: {e}",
+            "coordinates": None,
+        }
+
+
+def text_to_speech(text: str) -> BytesIO:
+    tts = gTTS(text)
+    mp3_fp = BytesIO()
+    tts.write_to_fp(mp3_fp)
+    mp3_fp.seek(0)
+    return mp3_fp
+
+
+# ---------------------------------------------------------------------------
+# Module 3: Personalized Tour Planner — Wikipedia + FAISS RAG
+# ---------------------------------------------------------------------------
+
+def detect_and_translate(city: str, preferences: str, llm: ChatGoogleGenerativeAI) -> tuple[str, str, str]:
+    """Detect the input language once and translate both city and preferences to English in a single call."""
+    prompt = f"""Detect the language the following two user inputs are written in (assume both are in the
+    same language), and translate each into English.
+
+    Respond with strict JSON only, no markdown, in exactly this shape:
+    {{"language": "<detected language name>", "city": "<city translated to English>", "preferences": "<preferences translated to English>"}}
+
+    City: {city}
+    Preferences: {preferences}
+    """
+    response = _invoke_with_retry(llm.invoke, prompt).content.strip()
+    response = _clean_json_like(response)
+    try:
+        data = json.loads(response)
+        return (
+            data.get("language", "English") or "English",
+            data.get("city", city) or city,
+            data.get("preferences", preferences) or preferences,
+        )
+    except json.JSONDecodeError:
+        return "English", city, preferences
+
+
+def translate_to_language(lang: str, text: str, llm: ChatGoogleGenerativeAI) -> str:
+    """Translate `text` into `lang` if it isn't already in that language."""
+    prompt = f"""If the given text is not in {lang}, translate it completely into {lang} and print only the
+    translated text. Otherwise, print the text as it is, with nothing else added.
+    Text: {text}
+    """
+    return _invoke_with_retry(llm.invoke, prompt).content.strip()
+
+
+def fetch_wikipedia_summary(place: str) -> str:
+    title = place.replace(" ", "_")
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "titles": title,
+        "explaintext": True,
+        "exlimit": 1,
+    }
+    # Wikipedia's API rejects/throttles requests without a descriptive User-Agent.
+    headers = {"User-Agent": "VirtuTrek-TourPlanner/1.0 (https://github.com/; contact: streamlit-demo)"}
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        pages = response.json()["query"]["pages"]
+        page = next(iter(pages.values()))
+        return page.get("extract", "")
+    except Exception:
+        return ""
+
+
+def get_food_recommendations(city: str) -> str:
+    """One web search + one formatting call (a ReAct agent loop here would burn several LLM calls
+    on a task that only ever needs a single search)."""
+    try:
+        search_results = search_google(f"Top vegetarian and non-vegetarian food in {city}")
+    except Exception as e:
+        search_results = f"(web search unavailable: {e})"
+
+    llm = _new_llm()
+    prompt = f"""Using the following web search results about food in {city}, write a short, friendly
+    summary (3-5 bullet points) of top vegetarian and non-vegetarian food recommendations.
+
+    Search results:
+    {search_results}
+    """
+    return _invoke_with_retry(llm.invoke, prompt).content.strip()
+
+
+def _ensure_nltk_punkt() -> None:
+    for resource in ("tokenizers/punkt_tab", "tokenizers/punkt"):
         try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return {"error": "Invalid JSON format returned", "raw_response": response}
-        
-class GeneralAgent:
+            nltk.data.find(resource)
+            return
+        except LookupError:
+            continue
+    nltk.download("punkt_tab", quiet=True)
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences, preferring NLTK's tokenizer but falling back to a
+    regex splitter if the punkt data can't be loaded/downloaded (e.g. no network, SSL issues)."""
+    try:
+        _ensure_nltk_punkt()
+        from nltk.tokenize import sent_tokenize
+
+        return sent_tokenize(text)
+    except Exception:
+        return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+
+
+def chunk_text(text: str, chunk_size: int = 5) -> list[str]:
+    sentences = _split_sentences(text)
+    if not sentences:
+        return [text] if text else []
+    return [" ".join(sentences[i:i + chunk_size]) for i in range(0, len(sentences), chunk_size)]
+
+
+def build_tour_index(chunks: list[str]):
+    import faiss
+
+    embedder = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GOOGLE_API_KEY)
+    embeddings = embedder.embed_documents(chunks)
+    dimension = len(embeddings[0])
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings).astype("float32"))
+    return index, embedder
+
+
+def retrieve_tour_snippets(query: str, chunks: list[str], index, embedder, k: int = 5) -> str:
+    k = min(k, len(chunks))
+    query_vec = np.array([embedder.embed_query(query)]).astype("float32")
+    _, matched_indices = index.search(query_vec, k)
+    return "\n\n".join(chunks[i] for i in matched_indices[0] if 0 <= i < len(chunks))
+
+
+TOUR_PLAN_PROMPT = PromptTemplate(
+    input_variables=["city", "mood", "preferences", "weather", "tour", "food"],
+    template="""
+    You are a friendly and knowledgeable AI travel guide helping users plan a personalized tour.
+
+    Using the following details:
+    - City: {city}
+    - Mood: {mood}
+    - Preferences: {preferences}
+    - Weather: {weather}
+    - Tour Info: {tour}
+    - Food: {food}
+
+    Generate a detailed and engaging travel plan.
+
+    Make sure to:
+    1. Suggest activities that match the mood and preferences.
+    2. Adapt the plan based on the weather (e.g., indoor if rainy).
+    3. Include must-see sights or hidden gems from the tour info.
+    4. Recommend local dishes or food experiences tailored to the user.
+    5. Use a friendly and conversational tone throughout.
+    6. End with an inviting summary of the experience.
+
+    Keep the tone warm, positive, and helpful - like a local friend planning a fun day!
+    """,
+)
+
+
+class TourPlannerAgent:
+    """Orchestrates the Wikipedia + weather + food + FAISS RAG tour-planning pipeline."""
+
     def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def general_topic(self, topic):
-        prompt = f"""You are an expert Research Agent specialized in gathering GENERAL INFORMATION about heritage sites across the world.
-
-                      Your task is to search the web and extract clear, concise, and accurate information about a given heritage site and return only FACTUAL details in a structured JSON format. You DO NOT narrate, assume, or summarize creatively. You also DO NOT include opinion, user reviews, or travel blog content.
-
-                      # INPUT:
-                      {topic}
-
-                      # TASKS:
-                      - Retrieve factual information from credible sources (e.g., UNESCO, official tourism boards, government sites, academic resources).
-                      - Extract key general facts including:
-                        - Full Name of Site
-                        - Country and City/Location
-                        - Year of Establishment or Recognition
-                        - Who built it or founded it (if applicable)
-                        - Historical Significance
-                        - Cultural Importance
-                        - UNESCO World Heritage status (yes/no and year)
-                        - Official Website (if available)
-
-                      # OUTPUT FORMAT (Strict JSON):
-                      {{
-                        "site": "site",
-                        "location": {{
-                          "country": "...",
-                          "city_or_region": "..."
-                        }},
-                        "established_year": "...",
-                        "founded_by": "...",
-                        "historical_significance": "...",
-                        "cultural_importance": "...",
-                        "unesco_status": {{
-                          "is_unesco_site": true,
-                          "designation_year": "..."
-                        }},
-                        "official_website": "..."
-                      }}
-
-                      # RULES:
-                      - DO NOT include unrelated content, tips, travel advice, or opinions.
-                      - NEVER make up facts. If data is missing, write `"unknown"` or `null`.
-                      - Avoid promotional or subjective content.
-                      - Only output the final structured JSON, no extra text.
-
-                      Begin researching and return the structured general information for the site: **site**
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-class LocationAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def locate(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving precise and factual LOCATION & ACCESSIBILITY information about global heritage sites.
-
-                      Your job is to query the web and extract details that help a visitor understand where the heritage site is located and how to reach it. You will output the data in a strictly structured JSON format.
-
-                      # INPUT:
-                      {topic}
-
-                      # TASKS:
-                      Search and extract the following:
-                      - Country and State/Region where the site is located
-                      - Nearest Major City or Airport
-                      - Popular modes of transportation to the site (road, train, air, etc.)
-                      - Accessibility status (wheelchair accessible, senior-friendly, etc.)
-                      - Distance from the nearest major city (if available)
-                      - Common travel routes or transit hubs (e.g., rail station, bus terminals)
-                      - Geo-coordinates (latitude and longitude) of the site
-
-                      # OUTPUT FORMAT (Strict JSON):
-                      {{
-                        "site": "site",
-                        "location": {{
-                          "country": "...",
-                          "state_or_region": "...",
-                          "nearest_major_city": "...",
-                          "distance_from_city_km": "...",
-                          "geo_coordinates": {{
-                            "latitude": "...",
-                            "longitude": "..."
-                          }}
-                        }},
-                        "transportation": {{
-                          "available_modes": ["road", "rail", "air"],
-                          "nearest_airport": "...",
-                          "nearest_rail_station": "...",
-                          "common_routes": "..."
-                        }},
-                        "accessibility": {{
-                          "wheelchair_accessible": true,
-                          "senior_friendly": true,
-                          "note": "..."
-                        }}
-                      }}
-
-                      # RULES:
-                      - Use ONLY factual info from reliable sources (official tourism boards, Google Maps, transportation sites).
-                      - DO NOT add opinions, travel tips, or promotional content.
-                      - DO NOT speculate—if a data point is unavailable, use `"unknown"` or `null`.
-                      - Only output the final structured JSON, nothing else.
-
-                      Begin researching and return structured location & accessibility data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-
-class TimeAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def time(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving precise and factual VISITING HOURS & TIMING information about global heritage sites.
-
-                      Your job is to query the web and extract structured information to help travelers know when they can visit the site. You will output the data in a strictly structured JSON format.
-
-                      # INPUT:
-                      {topic}
-
-
-                      # TASKS:
-                      Search and extract the following:
-                      - Opening days (e.g., Monday to Sunday, weekdays only, etc.)
-                      - Opening and closing times for each day (include seasonal variations if any)
-                      - Last entry time (if applicable)
-                      - Holidays or closed days (e.g., public holidays, maintenance days)
-                      - Time zone of the site
-                      - Duration of an average visit (if available)
-                      - Special night entry or evening programs (if applicable)
-
-                      # OUTPUT FORMAT (Strict JSON):
-                      {{
-                        "site": "site",
-                        "timing": {{
-                          "time_zone": "...",
-                          "weekly_schedule": {{
-                            "monday": {{ "open": "...", "close": "..." }},
-                            "tuesday": {{ "open": "...", "close": "..." }},
-                            "wednesday": {{ "open": "...", "close": "..." }},
-                            "thursday": {{ "open": "...", "close": "..." }},
-                            "friday": {{ "open": "...", "close": "..." }},
-                            "saturday": {{ "open": "...", "close": "..." }},
-                            "sunday": {{ "open": "...", "close": "..." }}
-                          }},
-                          "last_entry_time": "...",
-                          "closed_on": ["..."],
-                          "special_events": {{
-                            "night_entry_available": "true",
-                            "description": "..."
-                          }},
-                          "average_visit_duration": "..."
-                        }}
-                      }}
-
-                      # RULES:
-                      - Use ONLY factual info from official tourism websites or the official site page.
-                      - DO NOT include tips, travel suggestions, or opinions.
-                      - DO NOT speculate—if data is missing, use `"unknown"` or `null`.
-                      - Output ONLY the structured JSON response, nothing else.
-
-                      Begin researching and return structured visiting hours & timing data for: **site**
-
-                    """
-        response = self.agent.run(prompt)
-        return response
-    
-class TicketAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def ticket(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving precise and factual TICKETS & PRICING information about global heritage sites.
-
-                      Your task is to query the web and collect detailed information about entry costs, booking methods, and ticketing rules for the site. Output everything in a strictly structured JSON format.
-
-                      # INPUT:
-                      {topic}
-                     
-
-                      # TASKS:
-                      Search and extract the following:
-                      - General entry ticket prices for adults, children, and seniors (local and foreign)
-                      - Any ticket categories (e.g., guided tour, group ticket, fast track)
-                      - Discounts or free entry policies (e.g., students, disabled, residents)
-                      - Online booking options (website or platform)
-                      - On-site purchase availability
-                      - Currency used
-                      - Extra charges (e.g., camera fees, parking, special exhibitions)
-                      - Validity duration of the ticket (e.g., same day, multi-day pass)
-
-                      # OUTPUT FORMAT (Strict JSON):
-                      {{
-                        "site": "site",
-                        "ticketing": {{
-                          "currency": "...",
-                          "pricing": {{
-                            "local_adult": "...",
-                            "local_child": "...",
-                            "local_senior": "...",
-                            "foreign_adult": "...",
-                            "foreign_child": "...",
-                            "foreign_senior": "..."
-                          }},
-                          "ticket_types": [
-                            {{
-                              "type": "General Admission",
-                              "price": "...",
-                              "includes": "..."
-                            }},
-                            {{
-                              "type": "Guided Tour",
-                              "price": "...",
-                              "includes": "..."
-                            }}
-                          ],
-                          "discounts": {{
-                            "available_for": ["students", "disabled", "residents"],
-                            "details": "..."
-                          }},
-                          "booking": {{
-                            "online_available": true,
-                            "official_website": "...",
-                            "third_party_sites": ["..."],
-                            "on_site_purchase": true
-                          }},
-                          "additional_charges": {{
-                            "camera_fee": "...",
-                            "parking_fee": "...",
-                            "special_exhibit_fee": "..."
-                          }},
-                          "ticket_validity": "..."
-                        }}
-                      }}
-
-                      # RULES:
-                      - Pull data only from official or credible sources.
-                      - Do NOT include opinions, promotions, or tips.
-                      - If any info is not available, use `"unknown"` or `null`.
-                      - Output ONLY the final JSON object, no extra text or explanations.
-
-                      Begin researching and return structured ticket & pricing data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-    
-class CultureInsightsAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def culture(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving in-depth HISTORICAL & CULTURAL INSIGHTS about global heritage sites.
-
-                      Your job is to extract meaningful, factual data that explains the site’s origins, cultural relevance, associated traditions, and historical events. Output the data in a strictly structured JSON format.
-
-                      # INPUT:
-                      {topic}
-                    
-
-                      # TASKS:
-                      Search and extract the following:
-                      - Founding history and construction timeline
-                      - Historical significance (events, periods, dynasties, empires involved)
-                      - Key architectural or cultural features
-                      - Religious, spiritual, or ceremonial relevance
-                      - Associated myths, folklore, or legends (if widely cited)
-                      - UNESCO World Heritage status and the reason for designation
-                      - Role in national or regional identity
-                      - Notable restoration efforts or historical transitions
-
-                      # OUTPUT FORMAT (Strict JSON):
-                      {{
-                        "site": "site",
-                        "historical_background": {{
-                          "founded_in": "...",
-                          "built_by": "...",
-                          "construction_period": "...",
-                          "historical_events": ["..."],
-                          "dynasties_or_empires": ["..."],
-                          "unesco_status": {{
-                            "designated": true,
-                            "year": "...",
-                            "reason": "..."
-                          }}
-                        }},
-                        "cultural_significance": {{
-                          "religious_importance": "...",
-                          "myths_and_legends": "...",
-                          "cultural_identity": "...",
-                          "ceremonial_use": "...",
-                          "architectural_features": ["..."]
-                        }},
-                        "restoration_and_conservation": {{
-                          "major_restoration_years": ["..."],
-                          "preservation_status": "...",
-                          "governing_body": "..."
-                        }}
-                      }}
-
-                      # RULES:
-                      - Pull only from factual, credible sources (UNESCO, official heritage orgs, history archives).
-                      - Do NOT invent or assume. If a field is not available, use `"unknown"` or `null`.
-                      - Do NOT add personal interpretation or opinion.
-                      - Output ONLY the final JSON object, no surrounding text or explanations.
-
-                      Begin researching and return structured historical & cultural insight data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-    
-class TipsAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def tips(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving VISITOR TIPS & RULES for global heritage sites.
-
-                        Your task is to collect practical, official, and up-to-date information that helps tourists prepare for their visit while respecting local customs and regulations. Your output must be factual and follow the structured JSON format below.
-
-                        # INPUT:
-                        {topic}
-
-
-                        # TASKS:
-                        Search and extract the following:
-                        - General visitor guidelines or rules
-                        - Dress code (if any)
-                        - Photography or videography restrictions
-                        - Items allowed or prohibited inside the site
-                        - Conduct expectations (e.g., silence in temples, no touching artifacts)
-                        - Safety advice (e.g., slippery stairs, wildlife)
-                        - Peak hours to avoid / best times to visit
-                        - Tips for families, elderly, or solo travelers
-                        - Official warnings or restrictions due to events, restoration, etc.
-
-                        # OUTPUT FORMAT (Strict JSON):
-                        {{
-                        "site": "site",
-                        "rules": {{
-                            "dress_code": "...",
-                            "photography_allowed": true,
-                            "videography_allowed": false,
-                            "prohibited_items": ["..."],
-                            "conduct_guidelines": ["..."]
-                        }},
-                        "tips": {{
-                            "best_visit_times": "...",
-                            "peak_hours_to_avoid": "...",
-                            "safety_advice": ["..."],
-                            "family_friendly": true,
-                            "elderly_friendly": true,
-                            "solo_travel_tips": ["..."]
-                        }},
-                        "notices": {{
-                            "temporary_restrictions": "...",
-                            "special_guidelines": "..."
-                        }}
-                        }}
-
-                        # RULES:
-                        - Use only verified and official sources (e.g., government tourism websites, site management authorities).
-                        - Do NOT include user-generated content or personal opinions.
-                        - If information is unavailable, return `"unknown"` or `null`.
-                        - Output ONLY the structured JSON object—no surrounding text, summary, or explanation.
-
-                        Begin researching and return structured visitor guidance for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-    
-class FacilitiesAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def facility(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving factual and updated FACILITIES & NEARBY ATTRACTIONS information about global heritage sites.
-
-                        Your goal is to help visitors understand what amenities are available on-site and what notable locations or attractions are nearby. You will return data in a strictly structured JSON format.
-
-                        # INPUT:
-                        {topic}
-                        
-                        # TASKS:
-                        Search and extract the following:
-                        - On-site facilities (e.g., restrooms, drinking water, food courts, guided tour booths, wheelchair ramps)
-                        - Parking availability and details
-                        - Nearest accommodations (hotels, lodges, homestays within 5–10 km)
-                        - Emergency services nearby (hospitals, police station)
-                        - Notable attractions within 15–20 km (temples, museums, scenic spots, parks)
-                        - Visitor centers or help desks
-
-                        # OUTPUT FORMAT (Strict JSON):
-                        {{
-                        "site": "site",
-                        "facilities": {{
-                            "restrooms": true,
-                            "drinking_water": true,
-                            "food_courts": true,
-                            "guided_tour_services": true,
-                            "wheelchair_access": true,
-                            "parking_available": true,
-                            "visitor_center": true
-                        }},
-                        "nearby_accommodations": [
-                            {{
-                            "name": "...",
-                            "type": "hotel/homestay/lodge",
-                            "distance_km": "...",
-                            "contact": "..."
-                            }}
-                        ],
-                        "emergency_services": {{
-                            "nearest_hospital": "...",
-                            "hospital_distance_km": "...",
-                            "police_station": "...",
-                            "police_distance_km": "..."
-                        }},
-                        "nearby_attractions": [
-                            {{
-                            "name": "...",
-                            "type": "temple/museum/park/etc.",
-                            "distance_km": "..."
-                            }}
-                        ]
-                        }}
-
-                        # RULES:
-                        - Rely ONLY on reliable and verifiable sources such as Google Maps, official tourism websites, or local government listings.
-                        - DO NOT speculate—if any information is not available, return `"unknown"` or `null`.
-                        - DO NOT include suggestions, reviews, or tips—only factual data.
-                        - Output ONLY the structured JSON—no explanation, summary, or prose.
-
-                        Begin researching and return structured facilities and nearby attractions data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-
-class ExperienceAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def experience(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving information for CUSTOM EXPERIENCE planning related to global heritage sites.
-
-                        Your job is to extract data that helps travelers design a personalized, unique, and meaningful visit to a heritage site. Output must be in a structured JSON format.
-
-                        # INPUT:
-                        - Heritage Site: {topic}
-                        - Language: English
-                        - Category: Custom Experience
-
-                        # TASKS:
-                        Search and extract the following:
-                        - Available guided tours (official, private, or themed tours like photography, cultural immersion, etc.)
-                        - Exclusive experiences (sunrise/sunset viewing, local rituals, hidden trails, behind-the-scenes access)
-                        - Activities tailored for families, solo travelers, or senior citizens
-                        - Seasonal or time-specific experiences (e.g., festivals, events, special exhibitions)
-                        - Booking channels for custom packages (official website, licensed tour operators)
-
-                        # OUTPUT FORMAT (Strict JSON):
-                        {{
-                        "site": "site",
-                        "custom_experiences": {{
-                            "guided_tours": [
-                            {{
-                                "name": "...",
-                                "type": "official/private/themed",
-                                "duration_hours": "...",
-                                "available_languages": ["English", "..."],
-                                "booking_link": "..."
-                            }}
-                            ],
-                            "exclusive_experiences": [
-                            {{
-                                "name": "...",
-                                "description": "...",
-                                "best_time": "..."
-                            }}
-                            ],
-                            "tailored_activities": {{
-                            "for_families": "...",
-                            "for_solo_travelers": "...",
-                            "for_seniors": "..."
-                            }},
-                            "seasonal_events": [
-                            {{
-                                "event_name": "...",
-                                "description": "...",
-                                "season": "..."
-                            }}
-                            ],
-                            "booking_channels": ["...", "..."]
-                        }}
-                        }}
-
-                        # RULES:
-                        - Only use verified sources such as tourism boards, official tour sites, and travel platforms.
-                        - Avoid opinions, marketing phrases, or general travel advice.
-                        - Use `"unknown"` or `null` if any field cannot be found.
-                        - Do NOT output anything outside the structured JSON block.
-
-                        Begin researching and return structured custom experience data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-    
-    
-class RecommendationAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def recommend(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving COMPARISONS and RECOMMENDATIONS involving global heritage sites.
-
-                        Your job is to extract factual, non-opinionated comparisons between a given heritage site and other similar or nearby heritage sites. You also identify and suggest related sites worth visiting based on location, theme, or cultural context. Output must be structured in the JSON format below.
-
-                        # INPUT:
-                        - Heritage Site: {topic}
-                        - Language: English
-                        - Category: Comparison & Recommendations
-
-                        # TASKS:
-                        Search and extract the following:
-                        - Comparisons between the input site and other similar heritage sites (based on architecture, time period, cultural significance, or visitor experience)
-                        - Key similarities and differences
-                        - Recommended alternative or complementary sites to visit nearby or globally
-                        - Reason for each recommendation (e.g., architectural style, religious theme, UNESCO status, accessibility)
-
-                        # OUTPUT FORMAT (Strict JSON):
-                        {{
-                        "site": "site",
-                        "comparisons": [
-                            {{
-                            "compared_with": "...",
-                            "similarities": ["..."],
-                            "differences": ["..."]
-                            }}
-                        ],
-                        "recommendations": [
-                            {{
-                            "site_name": "...",
-                            "location": "...",
-                            "reason_for_recommendation": "..."
-                            }}
-                        ]
-                        }}
-
-                        # RULES:
-                        - Use only factual data from reliable sources like UNESCO, heritage tourism boards, cultural studies, or historical records.
-                        - Do NOT include subjective opinions or traveler reviews.
-                        - If comparison data is limited, keep fields minimal or use `"unknown"` or `null`.
-                        - Do NOT generate narrative content—return only the final JSON block.
-
-                        Begin researching and return structured comparison & recommendation data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-
-class LanguageAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-            handle_parsing_errors=True
-        )
-
-    def language(self, topic):
-        prompt = f"""You are a Research Agent specialized in retrieving LANGUAGE & CULTURE-related information for global heritage sites.
-
-                        Your task is to extract accurate data that helps a visitor understand the linguistic and cultural context of the heritage site. Output your findings strictly in the JSON format below.
-
-                        # INPUT:
-                        {topic}
-                        
-
-                        # TASKS:
-                        Search and extract the following:
-                        - Primary and secondary languages spoken in the region of the heritage site
-                        - Local dialects or indigenous languages (if any)
-                        - Cultural practices and traditions associated with the site or region
-                        - Festivals, rituals, or events held at or near the site
-                        - Religious or spiritual significance of the site (if applicable)
-                        - Etiquette or behavior expectations for visitors (dress code, greetings, taboos, etc.)
-
-                        # OUTPUT FORMAT (Strict JSON):
-                        {{
-                        "site": "site",
-                        "language": {{
-                            "primary": "...",
-                            "secondary": ["...", "..."],
-                            "local_dialects": ["...", "..."]
-                        }},
-                        "culture": {{
-                            "associated_traditions": ["...", "..."],
-                            "festivals_or_rituals": ["...", "..."],
-                            "religious_significance": "...",
-                            "visitor_etiquette": ["...", "..."]
-                        }}
-                        }}
-
-                        # RULES:
-                        - Use only verifiable sources (official cultural tourism boards, local government, UNESCO, academic sources).
-                        - Do NOT generate folklore, speculative traditions, or fictional details.
-                        - If information is not available, use `"unknown"` or `null`.
-                        - Return ONLY the structured JSON—no additional text or explanation.
-
-                        Begin researching and return structured language & culture data for: **site**
-
-                      """
-        response = self.agent.run(prompt)
-        return response
-    
-    
-class WriterAgent:
-    def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
-        self.tools = tools
-        self.agent = initialize_agent(
-            tools=self.tools,
-            llm=self.llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=True,
-            handle_parsing_errors=True
-        )
-
-    def write_article(self, research):
-        prompt = f"""You are a professional Travel & Culture Content Writer Agent.
-
-                        Your task is to convert structured research data into a clear, polished, and engaging description for readers interested in visiting or learning about heritage sites. Write professionally, avoid fluff or exaggeration, and focus strictly on the provided facts.
-
-                        # INPUT:
-                        {research}
-
-                        # INSTRUCTIONS:
-                        1. Use ONLY the data given in the JSON—do not make up any facts.
-                        2. Reword it into a smooth, readable paragraph or bullet format, depending on what best suits the content.
-                        3. If a data field is missing or marked "unknown", simply omit it from the output.
-                        4. For list-type data (e.g., features, traditions), use bullet points for readability.
-                        5. Maintain category context — write differently for General Info, Location, Historical Insights, etc.
-
-                        # OUTPUT FORMAT:
-                        Write a short, clean piece of text (max 200 words) that is:
-                        - Well-organized and logically structured.
-                        - Faithful to the structured data.
-                        - Ready to be published on a heritage site info page or travel portal.
-
-                        Now, write a polished informational passage for the category **category** at **site** using the data above.
-
-        
-        
-        """
-        response = self.agent.run(prompt)
-        return response
+        self.llm = _new_llm()
+
+    def plan(self, city: str, preferences: str, mood: str) -> dict:
+        # `mood` always comes from a fixed English selectbox, so it needs no translation.
+        lang, translated_city, translated_preferences = detect_and_translate(city, preferences, self.llm)
+        translated_mood = mood
+
+        wiki_text = fetch_wikipedia_summary(translated_city)
+        if not wiki_text:
+            wiki_text = f"{translated_city} is a notable travel destination with a variety of things to see and do."
+
+        weather_info = get_weather_summary_dict(translated_city)
+        food_recs = get_food_recommendations(translated_city)
+
+        chunks = chunk_text(wiki_text)
+        index, embedder = build_tour_index(chunks)
+        tour_query = f"Suggest a {translated_mood} tour in {translated_city} that includes {translated_preferences}"
+        tour_snippets = retrieve_tour_snippets(tour_query, chunks, index, embedder)
+
+        chain = TOUR_PLAN_PROMPT | self.llm
+        raw_plan = _invoke_with_retry(chain.invoke, {
+            "city": translated_city,
+            "mood": translated_mood,
+            "preferences": translated_preferences,
+            "weather": str(weather_info),
+            "tour": tour_snippets,
+            "food": str(food_recs),
+        }).content
+
+        # Only spend a call translating back if the user didn't write in English to begin with.
+        final_plan = raw_plan if lang.strip().lower() in ("english", "en") else translate_to_language(lang, raw_plan, self.llm)
+
+        return {
+            "language": lang,
+            "city": translated_city,
+            "weather": weather_info,
+            "food": food_recs,
+            "plan": final_plan,
+        }
